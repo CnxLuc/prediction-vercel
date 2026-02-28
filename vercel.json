@@ -1,0 +1,45 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/scanner.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxDuration": 60
+      }
+    },
+    {
+      "src": "api/bots.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxDuration": 60
+      }
+    },
+    {
+      "src": "public/**",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/scanner(.*)",
+      "dest": "/api/scanner.py"
+    },
+    {
+      "src": "/api/bots(.*)",
+      "dest": "/api/bots.py"
+    },
+    {
+      "src": "/arena",
+      "dest": "/public/arena.html"
+    },
+    {
+      "src": "/arena.html",
+      "dest": "/public/arena.html"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/public/$1"
+    }
+  ]
+}
