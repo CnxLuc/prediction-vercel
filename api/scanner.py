@@ -115,6 +115,72 @@ def fetch_polymarket_markets():
                 })
     return markets
 
+# ─── Kalshi Price Extraction ────────────────────────────────────────────────────────────
+
+def _normalize_to_cents(val):
+    """Normalize a price value to cents [0-100]. Values <= 1.0 are treated as dollars."""
+    if val is None:
+        return None
+    v = safe_float(val, None)
+    if v is None:
+        return None
+    if 0 < v <= 1.0:
+        v = v * 100
+    return v
+
+def extract_kalshi_yes_pct(market):
+    """Extract yes probability (in cents, 0-100) from a Kalshi market dict.
+
+    Fallback chain:
+      1. yes_price (if non-zero)
+      2. midpoint of yes_bid + yes_ask (if both non-zero)
+      3. single-sided: yes_ask alone (if yes_bid is zero/missing)
+      4. single-sided: yes_bid alone (if yes_ask is zero/missing)
+      5. last_price
+      6. dollar-denominated variants (yes_price_dollar, last_price_dollar)
+
+    Returns a value in (0, 100] or None if no valid price found.
+    """
+    # 1. yes_price
+    yes_price = _normalize_to_cents(market.get("yes_price"))
+    if yes_price is not None and yes_price > 0:
+        if yes_price > 100:
+            return None
+        return yes_price
+
+    # 2-4. bid/ask (with one-sided fallback)
+    yes_bid = _normalize_to_cents(market.get("yes_bid"))
+    yes_ask = _normalize_to_cents(market.get("yes_ask"))
+    bid_ok = yes_bid is not None and yes_bid > 0
+    ask_ok = yes_ask is not None and yes_ask > 0
+
+    if bid_ok and ask_ok:
+        mid = (yes_bid + yes_ask) / 2
+        if 0 < mid <= 100:
+            return mid
+    elif ask_ok:
+        if 0 < yes_ask <= 100:
+            return yes_ask
+    elif bid_ok:
+        if 0 < yes_bid <= 100:
+            return yes_bid
+
+    # 5. last_price
+    last = _normalize_to_cents(market.get("last_price"))
+    if last is not None and 0 < last <= 100:
+        return last
+
+    # 6. dollar-denominated explicit fields
+    for field in ("yes_price_dollar", "last_price_dollar"):
+        raw = safe_float(market.get(field), None)
+        if raw is not None and raw > 0:
+            cents = raw * 100
+            if 0 < cents <= 100:
+                return cents
+
+    return None
+
+
 # ─── Kalshi Fetcher ─────────────────────────────────────────────────────────────────────
 
 def fetch_kalshi_markets():
@@ -128,20 +194,16 @@ def fetch_kalshi_markets():
         if "error" in data:
             break
         for m in data.get("markets", []):
-            yes_price = safe_float(m.get("yes_price"), None)
-            if yes_price is not None:
-                yes_pct = yes_price
-            else:
-                yes_bid = safe_float(m.get("yes_bid"), 0)
-                yes_ask = safe_float(m.get("yes_ask"), 0)
-                yes_pct = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else 0
+            yes_pct = extract_kalshi_yes_pct(m)
+            if yes_pct is None or yes_pct <= 0:
+                continue
             markets.append({
                 "platform": "Kalshi",
                 "event_title": m.get("event_ticker", ""),
                 "market_title": m.get("title", ""),
                 "ticker": m.get("ticker", ""),
                 "event_ticker": m.get("event_ticker", ""),
-                "yes_price": yes_pct,
+                "yes_price": round(yes_pct, 1),
                 "volume": safe_float(m.get("volume", 0), 0),
                 "open_interest": safe_float(m.get("open_interest", 0), 0),
                 "category": m.get("category", "Other"),
