@@ -31,10 +31,24 @@ BUCKET = "bot-data"
 # Local /tmp fallback paths (used as write-through cache)
 BOTS_DB = Path("/tmp/bots_state.json")
 TRADES_DB = Path("/tmp/bots_trades.json")
+CYCLES_DB = Path("/tmp/bots_cycles.json")
 CACHE_FILE = Path("/tmp/bots_market_cache.json")
 CACHE_TTL = 1500  # ~25 min (so 30-min cron always gets fresh data)
+CYCLE_HISTORY_LIMIT = 1000
+CYCLE_RESPONSE_LIMIT = 150
 
 INITIAL_BANKROLL = 10000.0
+
+HOLD_REASON_MESSAGES = {
+    "AT_MAX_POSITIONS": "Need an open slot (or higher max_positions) before adding a new trade.",
+    "NO_EDGE_ABOVE_THRESHOLD": "Need a larger pricing edge before the strategy is allowed to enter.",
+    "NO_REFERENCE_MATCH": "Need markets that match available reference probability mappings.",
+    "LOW_LIQUIDITY": "Need sufficient market liquidity/volume for this strategy.",
+    "TOO_CLOSE_TO_EXPIRY": "Need markets with more time to expiry for this strategy.",
+    "DUPLICATE_MARKET_ALREADY_HELD": "Need a new market opportunity that is not already in the portfolio.",
+    "DEPENDENCY_DATA_UNAVAILABLE": "Need required upstream market data sources available.",
+    "NO_VALID_CANDIDATES": "Need at least one trade candidate that survives all strategy filters.",
+}
 
 
 # ─── Supabase Storage Helpers ─────────────────────────────────────────────────────
@@ -255,6 +269,70 @@ def fetch_polymarket_markets():
                 })
     return markets
 
+def _normalize_to_cents(val):
+    """Normalize a price value to cents [0-100]. Values <= 1.0 are treated as dollars."""
+    if val is None:
+        return None
+    v = safe_float(val, None)
+    if v is None:
+        return None
+    if 0 < v <= 1.0:
+        v = v * 100
+    return v
+
+def extract_kalshi_yes_pct(market):
+    """Extract yes probability (in cents, 0-100) from a Kalshi market dict.
+
+    Fallback chain:
+      1. yes_price (if non-zero)
+      2. midpoint of yes_bid + yes_ask (if both non-zero)
+      3. single-sided: yes_ask alone (if yes_bid is zero/missing)
+      4. single-sided: yes_bid alone (if yes_ask is zero/missing)
+      5. last_price
+      6. dollar-denominated variants (yes_price_dollar, last_price_dollar)
+
+    Returns a value in (0, 100] or None if no valid price found.
+    """
+    # 1. yes_price
+    yes_price = _normalize_to_cents(market.get("yes_price"))
+    if yes_price is not None and yes_price > 0:
+        if yes_price > 100:
+            return None
+        return yes_price
+
+    # 2-4. bid/ask (with one-sided fallback)
+    yes_bid = _normalize_to_cents(market.get("yes_bid"))
+    yes_ask = _normalize_to_cents(market.get("yes_ask"))
+    bid_ok = yes_bid is not None and yes_bid > 0
+    ask_ok = yes_ask is not None and yes_ask > 0
+
+    if bid_ok and ask_ok:
+        mid = (yes_bid + yes_ask) / 2
+        if 0 < mid <= 100:
+            return mid
+    elif ask_ok:
+        if 0 < yes_ask <= 100:
+            return yes_ask
+    elif bid_ok:
+        if 0 < yes_bid <= 100:
+            return yes_bid
+
+    # 5. last_price
+    last = _normalize_to_cents(market.get("last_price"))
+    if last is not None and 0 < last <= 100:
+        return last
+
+    # 6. dollar-denominated explicit fields
+    for field in ("yes_price_dollar", "last_price_dollar"):
+        raw = safe_float(market.get(field), None)
+        if raw is not None and raw > 0:
+            cents = raw * 100
+            if 0 < cents <= 100:
+                return cents
+
+    return None
+
+
 def fetch_kalshi_markets():
     markets = []
     cursor = None
@@ -266,14 +344,8 @@ def fetch_kalshi_markets():
         if "error" in data:
             break
         for m in data.get("markets", []):
-            yes_price = safe_float(m.get("yes_price"), None)
-            if yes_price is not None:
-                yes_pct = yes_price
-            else:
-                yes_bid = safe_float(m.get("yes_bid"), 0)
-                yes_ask = safe_float(m.get("yes_ask"), 0)
-                yes_pct = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else 0
-            if yes_pct <= 0:
+            yes_pct = extract_kalshi_yes_pct(m)
+            if yes_pct is None or yes_pct <= 0:
                 continue
             markets.append({
                 "platform": "Kalshi",
@@ -785,12 +857,47 @@ def save_trades(trades):
         pass
     sb_write("bots_trades.json", trades)
 
+def load_cycles():
+    data = sb_read("bots_cycles.json")
+    if data and isinstance(data, list):
+        try:
+            CYCLES_DB.write_text(json.dumps(data))
+        except:
+            pass
+        return data
+    if CYCLES_DB.exists():
+        try:
+            return json.loads(CYCLES_DB.read_text())
+        except:
+            pass
+    return []
+
+def save_cycles(cycles):
+    try:
+        CYCLES_DB.write_text(json.dumps(cycles, indent=2))
+    except:
+        pass
+    sb_write("bots_cycles.json", cycles)
+
+def add_hold_reason(reason_counts, reason):
+    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+def top_hold_reasons(reason_counts, limit=3):
+    ranked = sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    return [{"reason": reason, "count": count} for reason, count in ranked[:limit]]
+
+def next_trade_condition(top_reasons):
+    if not top_reasons:
+        return ""
+    lead_reason = top_reasons[0]["reason"]
+    return HOLD_REASON_MESSAGES.get(lead_reason, "Need a qualifying setup for this strategy.")
+
 
 # ─── Main Engine ───────────────────────────────────────────────────────────────────────
 
 def run_bot_engine():
     now = datetime.now(timezone.utc)
-    current_hour = now.strftime("%Y-%m-%dT%H")
+    cycle_ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     
     # Try loading cache from /tmp first, then Supabase
     cache = None
@@ -818,43 +925,58 @@ def run_bot_engine():
     all_markets = poly_markets + kalshi_markets
     state = load_state()
     all_trades = load_trades()
+    all_cycles = load_cycles()
     bot_results = []
     new_trades = []
+    new_cycles = []
     
     for bot in BOTS:
         bot_state = state.get(bot["id"], {
             "bankroll": INITIAL_BANKROLL, "total_trades": 0, "winning_trades": 0,
             "total_pnl": 0, "peak_bankroll": INITIAL_BANKROLL, "positions": [],
-            "equity_curve": [{"time": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "value": INITIAL_BANKROLL}],
+            "equity_curve": [{"time": cycle_ts, "value": INITIAL_BANKROLL}],
         })
+        max_pos = bot["params"].get("max_positions", 5)
+        hold_reason_counts = {}
         
         strategy_fn = STRATEGY_MAP.get(bot["strategy"])
         if not strategy_fn:
             continue
+
+        if not all_markets:
+            add_hold_reason(hold_reason_counts, "DEPENDENCY_DATA_UNAVAILABLE")
+        if bot["strategy"] == "cross_platform_arb" and (not poly_markets or not kalshi_markets):
+            add_hold_reason(hold_reason_counts, "DEPENDENCY_DATA_UNAVAILABLE")
         
         try:
             proposed_trades = strategy_fn(bot, all_markets, poly_markets, kalshi_markets, bot_state)
         except Exception as e:
             proposed_trades = []
+            add_hold_reason(hold_reason_counts, "DEPENDENCY_DATA_UNAVAILABLE")
+        candidates_scanned = len(all_markets)
+        candidates_after_filters = len(proposed_trades)
         
         existing_market_keys = set()
         for pos in bot_state.get("positions", []):
             existing_market_keys.add(normalize_title(pos.get("market", "")))
+        if len(bot_state.get("positions", [])) >= max_pos:
+            add_hold_reason(hold_reason_counts, "AT_MAX_POSITIONS")
         
         executed_trades = []
         for trade in proposed_trades:
             trade_key = normalize_title(trade["market"])
             if trade_key in existing_market_keys:
+                add_hold_reason(hold_reason_counts, "DUPLICATE_MARKET_ALREADY_HELD")
                 continue
             current_positions = len(bot_state.get("positions", []))
-            max_pos = bot["params"].get("max_positions", 5)
             if current_positions + len(executed_trades) >= max_pos:
+                add_hold_reason(hold_reason_counts, "AT_MAX_POSITIONS")
                 break
             slipped_entry = apply_slippage(trade["market_price"], trade["direction"])
             trade_record = {
                 "id": hashlib.md5(f"{bot['id']}:{trade['market']}:{now.isoformat()}".encode()).hexdigest()[:12],
                 "bot_id": bot["id"], "bot_name": bot["name"],
-                "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "timestamp": cycle_ts,
                 "market": trade["market"], "platform": trade["platform"],
                 "url": trade.get("url", ""), "category": trade.get("category", "Other"),
                 "direction": trade["direction"],
@@ -873,7 +995,7 @@ def run_bot_engine():
                 "trade_id": trade_record["id"], "market": trade["market"],
                 "direction": trade["direction"], "entry_price": round(slipped_entry, 2),
                 "current_price": trade["market_price"], "bet_amount": trade["bet_amount"],
-                "timestamp": trade_record["timestamp"], "platform": trade["platform"],
+                "timestamp": cycle_ts, "platform": trade["platform"],
                 "url": trade.get("url", ""),
             })
         
@@ -925,15 +1047,37 @@ def run_bot_engine():
         bot_state["peak_bankroll"] = max(bot_state.get("peak_bankroll", INITIAL_BANKROLL), current_equity)
         
         equity_curve = bot_state.get("equity_curve", [])
-        equity_curve.append({"time": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "value": round(current_equity, 2)})
+        equity_curve.append({"time": cycle_ts, "value": round(current_equity, 2)})
         if len(equity_curve) > 168:
             equity_curve = equity_curve[-168:]
         bot_state["equity_curve"] = equity_curve
         
         win_rate = (bot_state["winning_trades"] / bot_state["total_trades"] * 100) if bot_state["total_trades"] > 0 else 0
+        decision = "TRADE" if executed_trades else "HOLD"
+        if decision == "HOLD" and not hold_reason_counts:
+            if candidates_after_filters == 0:
+                add_hold_reason(hold_reason_counts, "NO_VALID_CANDIDATES")
+                add_hold_reason(hold_reason_counts, "NO_EDGE_ABOVE_THRESHOLD")
+            else:
+                add_hold_reason(hold_reason_counts, "NO_EDGE_ABOVE_THRESHOLD")
+        top_reasons = top_hold_reasons(hold_reason_counts) if decision == "HOLD" else []
+        latest_cycle = {
+            "id": hashlib.md5(f"{bot['id']}:{cycle_ts}".encode()).hexdigest()[:12],
+            "bot_id": bot["id"],
+            "bot_name": bot["name"],
+            "cycle_timestamp": cycle_ts,
+            "decision": decision,
+            "open_positions": len(bot_state.get("positions", [])),
+            "max_positions": max_pos,
+            "candidates_scanned": candidates_scanned,
+            "candidates_after_filters": candidates_after_filters,
+            "top_hold_reasons": top_reasons,
+            "next_trade_condition": next_trade_condition(top_reasons) if decision == "HOLD" else "",
+        }
         
         state[bot["id"]] = bot_state
         new_trades.extend(executed_trades)
+        new_cycles.append(latest_cycle)
         
         bot_results.append({
             **{k: v for k, v in bot.items() if k != "params"},
@@ -952,6 +1096,7 @@ def run_bot_engine():
             "equity_curve": bot_state.get("equity_curve", []),
             "new_trades": executed_trades,
             "strategy_params": bot["params"],
+            "latest_cycle": latest_cycle,
         })
     
     save_state(state)
@@ -959,16 +1104,21 @@ def run_bot_engine():
     if len(all_trades) > 500:
         all_trades = all_trades[-500:]
     save_trades(all_trades)
+    all_cycles.extend(new_cycles)
+    if len(all_cycles) > CYCLE_HISTORY_LIMIT:
+        all_cycles = all_cycles[-CYCLE_HISTORY_LIMIT:]
+    save_cycles(all_cycles)
     
     return {
         "timestamp": time.time(),
-        "lastUpdated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "lastUpdated": cycle_ts,
         "lastUpdatedHuman": now.strftime("%d %b %Y %H:%M GMT"),
         "totalMarkets": len(all_markets),
         "polymarketCount": len(poly_markets),
         "kalshiCount": len(kalshi_markets),
         "bots": bot_results,
         "recentTrades": sorted(new_trades + all_trades[-50:], key=lambda t: t["timestamp"], reverse=True)[:50],
+        "recentCycles": sorted(new_cycles + all_cycles[-CYCLE_RESPONSE_LIMIT:], key=lambda c: c["cycle_timestamp"], reverse=True)[:CYCLE_RESPONSE_LIMIT],
         "newTradesCount": len(new_trades),
     }
 
@@ -991,6 +1141,14 @@ class handler(BaseHTTPRequestHandler):
                     trades = [t for t in trades if t["bot_id"] == bot_filter]
                 result = {"trades": trades[-100:], "total": len(trades)}
             
+            elif action == "cycles":
+                cycles = load_cycles()
+                bot_filter = params.get("bot")
+                if bot_filter:
+                    cycles = [c for c in cycles if c.get("bot_id") == bot_filter]
+                cycles = sorted(cycles, key=lambda c: c.get("cycle_timestamp", ""), reverse=True)
+                result = {"cycles": cycles[:CYCLE_RESPONSE_LIMIT], "total": len(cycles)}
+            
             elif action == "bot":
                 bot_id = params.get("id")
                 if not bot_id:
@@ -1003,7 +1161,10 @@ class handler(BaseHTTPRequestHandler):
                     else:
                         all_trades = load_trades()
                         bot_trades = [t for t in all_trades if t["bot_id"] == bot_id]
+                        all_cycles = load_cycles()
+                        bot_cycles = [c for c in all_cycles if c.get("bot_id") == bot_id]
                         bot_data["trade_history"] = bot_trades[-50:]
+                        bot_data["cycle_history"] = sorted(bot_cycles, key=lambda c: c.get("cycle_timestamp", ""), reverse=True)[:50]
                         result = bot_data
             
             elif action == "reset":
@@ -1011,8 +1172,11 @@ class handler(BaseHTTPRequestHandler):
                     BOTS_DB.unlink()
                 if TRADES_DB.exists():
                     TRADES_DB.unlink()
+                if CYCLES_DB.exists():
+                    CYCLES_DB.unlink()
                 sb_delete("bots_state.json")
                 sb_delete("bots_trades.json")
+                sb_delete("bots_cycles.json")
                 result = {"status": "reset", "message": "All bots reset to $10,000"}
             
             elif action == "debug":
